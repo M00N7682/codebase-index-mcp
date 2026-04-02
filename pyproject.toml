@@ -1,0 +1,21 @@
+[project]
+name = "codebase-index-mcp"
+version = "0.1.0"
+description = "MCP server that indexes codebases to eliminate Claude's exploration overhead"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+]
+
+[project.scripts]
+codebase-index = "codebase_index.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codebase_index"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/codebase_index"]
