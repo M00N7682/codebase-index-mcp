@@ -5,8 +5,11 @@ import os
 
 from mcp.server.fastmcp import FastMCP
 
-from .indexer import ensure_index, build_index, get_recent_git_changes
-from .query import find_relevant_files, get_project_summary
+from .models import NotAGitRepoError
+from .indexer import ensure_index, build_index
+from .git_ops import get_recent_changes
+from .storage import get_db, get_file, get_file_count, get_metadata
+from .ranking import find_relevant_files, get_project_summary
 
 mcp = FastMCP(
   "codebase-index",
@@ -25,11 +28,15 @@ def _resolve_root(project_path: str | None) -> str:
   return os.getcwd()
 
 
+def _error_json(msg: str) -> str:
+  return json.dumps({"error": msg})
+
+
 @mcp.tool()
 def find_files_for_task(task: str, project_path: str = "") -> str:
   """
   The primary tool. Given a natural language task description,
-  returns the most relevant files to read — ranked by relevance.
+  returns the most relevant files to read — ranked by BM25 + PageRank.
 
   Use this BEFORE exploring the codebase with Glob/Grep/Read.
   This single call replaces 10-20 exploration tool calls.
@@ -42,19 +49,24 @@ def find_files_for_task(task: str, project_path: str = "") -> str:
     project_path: Absolute path to the project root. Defaults to cwd.
   """
   root = _resolve_root(project_path or None)
-  index = ensure_index(root)
-  results = find_relevant_files(index, task)
+  try:
+    ensure_index(root)
+  except NotAGitRepoError:
+    return _error_json(f"Not a git repository: {root}")
+
+  db = get_db(root)
+  results = find_relevant_files(db, task)
 
   if not results:
     return json.dumps({
       "message": "No relevant files found. Try different keywords.",
-      "indexed_files": len(index.files),
+      "indexed_files": get_file_count(db),
     })
 
   return json.dumps({
     "task": task,
     "relevant_files": results,
-    "total_indexed": len(index.files),
+    "total_indexed": get_file_count(db),
     "tip": "Read the top-scored files first. They are most likely to contain what you need.",
   }, ensure_ascii=False, indent=2)
 
@@ -72,8 +84,13 @@ def get_project_overview(project_path: str = "") -> str:
     project_path: Absolute path to the project root. Defaults to cwd.
   """
   root = _resolve_root(project_path or None)
-  index = ensure_index(root)
-  summary = get_project_summary(index)
+  try:
+    ensure_index(root)
+  except NotAGitRepoError:
+    return _error_json(f"Not a git repository: {root}")
+
+  db = get_db(root)
+  summary = get_project_summary(db)
   return json.dumps(summary, ensure_ascii=False, indent=2)
 
 
@@ -92,11 +109,15 @@ def get_file_context(file_path: str, project_path: str = "") -> str:
     project_path: Absolute path to the project root. Defaults to cwd.
   """
   root = _resolve_root(project_path or None)
-  index = ensure_index(root)
+  try:
+    ensure_index(root)
+  except NotAGitRepoError:
+    return _error_json(f"Not a git repository: {root}")
 
-  fi = index.files.get(file_path)
+  db = get_db(root)
+  fi = get_file(db, file_path)
   if fi is None:
-    return json.dumps({"error": f"File '{file_path}' not found in index."})
+    return _error_json(f"File '{file_path}' not found in index.")
 
   return json.dumps({
     "path": fi.path,
@@ -121,7 +142,7 @@ def get_recent_changes(project_path: str = "", since: str = "7 days ago") -> str
     since: Git time expression. Examples: "3 days ago", "1 week ago", "2025-01-01"
   """
   root = _resolve_root(project_path or None)
-  changes = get_recent_git_changes(root, since)
+  changes = get_recent_changes(root, since)
 
   if not changes:
     return json.dumps({"message": f"No changes found since {since}."})
@@ -142,11 +163,16 @@ def rebuild_index(project_path: str = "") -> str:
     project_path: Absolute path to the project root. Defaults to cwd.
   """
   root = _resolve_root(project_path or None)
-  index = build_index(root)
+  try:
+    count = build_index(root)
+  except NotAGitRepoError:
+    return _error_json(f"Not a git repository: {root}")
+
+  db = get_db(root)
   return json.dumps({
     "message": "Index rebuilt successfully.",
-    "files_indexed": len(index.files),
-    "git_hash": index.git_hash,
+    "files_indexed": count,
+    "git_hash": get_metadata(db, "git_hash") or "",
   })
 
 

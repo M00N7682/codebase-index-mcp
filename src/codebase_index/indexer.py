@@ -1,146 +1,113 @@
-"""Core indexing logic — build, persist, and incrementally update the codebase index."""
+"""Index orchestration — build, update, and ensure freshness."""
 
-import json
-import subprocess
-from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .parsers import FileInfo, Symbol, parse_file, should_skip_path, detect_language
-
-INDEX_DIR = ".codebase-index"
-INDEX_FILE = "index.json"
-
-
-@dataclass
-class ProjectIndex:
-  root: str
-  git_hash: str
-  files: dict[str, FileInfo]
-  updated_at: str
-
-  def to_dict(self) -> dict:
-    return {
-      "root": self.root,
-      "git_hash": self.git_hash,
-      "updated_at": self.updated_at,
-      "file_count": len(self.files),
-      "files": {
-        path: {
-          "language": fi.language,
-          "lines": fi.lines,
-          "symbols": [
-            {"name": s.name, "kind": s.kind, "line": s.line}
-            for s in fi.symbols
-          ],
-          "imports": fi.imports,
-        }
-        for path, fi in self.files.items()
-      },
-    }
-
-  @classmethod
-  def from_dict(cls, data: dict) -> "ProjectIndex":
-    files = {}
-    for path, fd in data.get("files", {}).items():
-      symbols = [
-        Symbol(s["name"], s["kind"], s["line"])
-        for s in fd.get("symbols", [])
-      ]
-      files[path] = FileInfo(
-        path=path,
-        language=fd["language"],
-        lines=fd["lines"],
-        symbols=symbols,
-        imports=fd.get("imports", []),
-      )
-    return cls(
-      root=data["root"],
-      git_hash=data["git_hash"],
-      files=files,
-      updated_at=data["updated_at"],
-    )
+from .models import (
+  detect_language, should_skip_path, NotAGitRepoError, INDEX_DIR,
+)
+from .git_ops import (
+  is_git_repo, get_git_hash, get_tracked_files,
+  get_changed_files, read_file_safe,
+)
+from .parser import parse_file
+from .storage import (
+  get_db, get_metadata, set_metadata, upsert_file, delete_file,
+  get_file_count, get_all_file_ids, get_all_imports,
+  clear_import_edges, insert_import_edges, update_pagerank_scores,
+  get_import_edge_list, migrate_from_json,
+)
 
 
-def _git(root: str, *args: str) -> str:
-  """Run a git command and return stdout."""
-  result = subprocess.run(
-    ["git", *args],
-    cwd=root,
-    capture_output=True,
-    text=True,
-    timeout=30,
-  )
-  return result.stdout.strip()
+def _resolve_imports(db) -> None:
+  """Resolve raw import strings to actual file paths, populate import_edges."""
+  file_ids = get_all_file_ids(db)  # path → id
+  all_imports = get_all_imports(db)  # [(file_id, raw_import), ...]
+
+  # Build suffix lookup: "models/entities" → file_id for "src/domain/models/entities.py"
+  suffix_map: dict[str, int] = {}
+  for path, fid in file_ids.items():
+    # Generate multiple suffix keys for matching
+    stem = Path(path).with_suffix("").as_posix()  # "src/domain/models/entities"
+    parts = stem.split("/")
+    for i in range(len(parts)):
+      suffix = "/".join(parts[i:])
+      # Only store if not ambiguous (first wins)
+      if suffix not in suffix_map:
+        suffix_map[suffix] = fid
+
+  edges: list[tuple[int, int]] = []
+  for source_id, raw_import in all_imports:
+    # Normalize import: dots → slashes, strip quotes
+    imp = raw_import.strip("'\"").replace(".", "/").replace("::", "/")
+
+    # Try exact suffix match
+    target_id = suffix_map.get(imp)
+    if target_id and target_id != source_id:
+      edges.append((source_id, target_id))
+      continue
+
+    # Try with common file extensions stripped
+    for suffix in [imp, imp.split("/")[-1]]:
+      if suffix in suffix_map:
+        tid = suffix_map[suffix]
+        if tid != source_id:
+          edges.append((source_id, tid))
+          break
+
+  clear_import_edges(db)
+  if edges:
+    insert_import_edges(db, edges)
 
 
-def get_git_hash(root: str) -> str:
-  return _git(root, "rev-parse", "HEAD")
+def _compute_pagerank(db) -> None:
+  """Compute PageRank on import graph and store scores."""
+  edges = get_import_edge_list(db)
+  if not edges:
+    return
 
+  file_ids = get_all_file_ids(db)
+  all_ids = set(file_ids.values())
 
-def get_tracked_files(root: str) -> list[str]:
-  """Get all git-tracked files."""
-  output = _git(root, "ls-files")
-  if not output:
-    return []
-  return [f for f in output.split("\n") if f]
-
-
-def get_changed_files(root: str, since_hash: str) -> list[str]:
-  """Get files changed between since_hash and HEAD."""
-  output = _git(root, "diff", "--name-only", since_hash, "HEAD")
-  if not output:
-    return []
-  return [f for f in output.split("\n") if f]
-
-
-def get_recent_git_changes(root: str, since: str = "7 days ago") -> list[dict]:
-  """Get recent commits with changed files."""
-  fmt = "%H|%an|%s|%ai"
-  output = _git(root, "log", f"--since={since}", f"--pretty=format:{fmt}", "--name-only")
-  if not output:
-    return []
-
-  commits = []
-  current: dict | None = None
-  for line in output.split("\n"):
-    if "|" in line and line.count("|") >= 3:
-      parts = line.split("|", 3)
-      if len(parts) == 4:
-        if current:
-          commits.append(current)
-        current = {
-          "hash": parts[0][:8],
-          "author": parts[1],
-          "message": parts[2],
-          "date": parts[3],
-          "files": [],
-        }
-    elif line.strip() and current is not None:
-      current["files"].append(line.strip())
-
-  if current:
-    commits.append(current)
-  return commits
-
-
-def _read_file_safe(root: str, path: str) -> str | None:
-  """Read file content, return None on failure."""
   try:
-    full = Path(root) / path
-    if full.stat().st_size > 500_000:  # skip files > 500KB
-      return None
-    return full.read_text(encoding="utf-8", errors="ignore")
-  except (OSError, UnicodeDecodeError):
-    return None
+    import networkx as nx
+  except ImportError:
+    # networkx not installed — skip PageRank
+    return
+
+  G = nx.DiGraph()
+  G.add_nodes_from(all_ids)
+  G.add_edges_from(edges)
+
+  try:
+    scores = nx.pagerank(G, alpha=0.85, max_iter=100)
+  except nx.PowerIterationFailedConvergence:
+    scores = nx.pagerank(G, alpha=0.85, max_iter=50, tol=1e-3)
+
+  update_pagerank_scores(db, scores)
 
 
-def build_index(root: str) -> ProjectIndex:
-  """Build a full index from scratch."""
+def _now_iso() -> str:
+  return datetime.now(timezone.utc).isoformat()
+
+
+def build_index(root: str) -> int:
+  """Build a full index from scratch. Returns number of files indexed."""
   root = str(Path(root).resolve())
+
+  if not is_git_repo(root):
+    raise NotAGitRepoError(f"Not a git repository: {root}")
+
+  db = get_db(root)
   git_hash = get_git_hash(root)
   tracked = get_tracked_files(root)
-  files: dict[str, FileInfo] = {}
+  now = _now_iso()
+  count = 0
+
+  # Clear existing data
+  db.execute("DELETE FROM code_files")
+  db.execute("DELETE FROM search_index")
+  db.commit()
 
   for path in tracked:
     if should_skip_path(path):
@@ -148,87 +115,88 @@ def build_index(root: str) -> ProjectIndex:
     lang = detect_language(path)
     if lang == "unknown":
       continue
-
-    content = _read_file_safe(root, path)
+    content = read_file_safe(root, path)
     if content is None:
       continue
 
     fi = parse_file(path, content)
-    files[path] = fi
+    upsert_file(db, fi, now)
+    count += 1
 
-  index = ProjectIndex(
-    root=root,
-    git_hash=git_hash,
-    files=files,
-    updated_at=datetime.now(timezone.utc).isoformat(),
-  )
-  save_index(index)
-  return index
+  set_metadata(db, "git_hash", git_hash)
+  set_metadata(db, "updated_at", now)
+  db.commit()
+
+  # Build import graph + PageRank
+  _resolve_imports(db)
+  _compute_pagerank(db)
+  db.commit()
+
+  return count
 
 
-def update_index(index: ProjectIndex) -> ProjectIndex:
-  """Incrementally update an existing index."""
-  root = index.root
-  new_hash = get_git_hash(root)
+def update_index(root: str) -> bool:
+  """Incrementally update index. Returns True if updated, False if already fresh."""
+  root = str(Path(root).resolve())
+  db = get_db(root)
 
-  if new_hash == index.git_hash:
-    return index
+  stored_hash = get_metadata(db, "git_hash")
+  current_hash = get_git_hash(root)
 
-  changed = get_changed_files(root, index.git_hash)
+  if stored_hash == current_hash:
+    return False
+
+  changed = get_changed_files(root, stored_hash or "")
+  if not changed and stored_hash:
+    set_metadata(db, "git_hash", current_hash)
+    db.commit()
+    return False
+
   tracked_set = set(get_tracked_files(root))
+  now = _now_iso()
 
   for path in changed:
-    # file deleted
     if path not in tracked_set:
-      index.files.pop(path, None)
+      delete_file(db, path)
       continue
     if should_skip_path(path):
       continue
     lang = detect_language(path)
     if lang == "unknown":
       continue
-
-    content = _read_file_safe(root, path)
+    content = read_file_safe(root, path)
     if content is None:
-      index.files.pop(path, None)
+      delete_file(db, path)
       continue
 
     fi = parse_file(path, content)
-    index.files[path] = fi
+    upsert_file(db, fi, now)
 
-  index.git_hash = new_hash
-  index.updated_at = datetime.now(timezone.utc).isoformat()
-  save_index(index)
-  return index
+  set_metadata(db, "git_hash", current_hash)
+  set_metadata(db, "updated_at", now)
+  db.commit()
 
+  # Rebuild import graph + PageRank after changes
+  _resolve_imports(db)
+  _compute_pagerank(db)
+  db.commit()
 
-def save_index(index: ProjectIndex) -> None:
-  """Persist index to disk."""
-  idx_dir = Path(index.root) / INDEX_DIR
-  idx_dir.mkdir(exist_ok=True)
-  idx_path = idx_dir / INDEX_FILE
-  idx_path.write_text(
-    json.dumps(index.to_dict(), ensure_ascii=False, indent=1),
-    encoding="utf-8",
-  )
+  return True
 
 
-def load_index(root: str) -> ProjectIndex | None:
-  """Load index from disk, return None if not found."""
+def ensure_index(root: str) -> None:
+  """Ensure the index exists and is fresh. Auto-migrates from JSON if needed."""
   root = str(Path(root).resolve())
-  idx_path = Path(root) / INDEX_DIR / INDEX_FILE
-  if not idx_path.exists():
-    return None
-  try:
-    data = json.loads(idx_path.read_text(encoding="utf-8"))
-    return ProjectIndex.from_dict(data)
-  except (json.JSONDecodeError, KeyError):
-    return None
 
+  if not is_git_repo(root):
+    raise NotAGitRepoError(f"Not a git repository: {root}")
 
-def ensure_index(root: str) -> ProjectIndex:
-  """Load existing index and update, or build from scratch."""
-  existing = load_index(root)
-  if existing is None:
-    return build_index(root)
-  return update_index(existing)
+  db = get_db(root)
+
+  # Auto-migrate from old JSON format
+  migrate_from_json(root, db)
+
+  if get_file_count(db) == 0:
+    build_index(root)
+  else:
+    update_index(root)
