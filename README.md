@@ -114,7 +114,9 @@ Python, TypeScript, JavaScript, Go, Rust, Java, Kotlin, Ruby, C, C++, C#, Swift,
 
 ```
 src/codebase_index/
-├── server.py              # MCP 서버 (AI 도구와 연결되는 인터페이스)
+├── hook.py                # Hook 진입점 (프로젝트 맵 stdout 출력)
+├── compact_map.py         # 프로젝트 맵 생성 (~400 토큰)
+├── server.py              # MCP 서버 (선택사항)
 ├── models.py              # 데이터 구조 정의
 ├── git_ops.py             # git 연동
 ├── treesitter_parser.py   # 코드 분석 (AST 파싱)
@@ -140,7 +142,49 @@ cd codebase-index-mcp
 uv venv && uv pip install -e .
 ```
 
-### Claude Code에 연결하기
+### Claude Code에 연결하기 (Hook 방식 — 권장)
+
+`~/.claude/settings.json`의 `hooks` 안에 추가:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/codebase-index-mcp/.venv/bin/python -m codebase_index.hook"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+이게 끝입니다. Claude Code를 재시작하면:
+
+1. 매 프롬프트 시 hook이 실행됩니다 (77ms, 거의 즉시)
+2. 프로젝트 지도(~400 토큰)가 Claude 컨텍스트에 자동 주입됩니다
+3. Claude는 지도를 보고 탐색 없이 바로 작업을 시작합니다
+4. Anthropic의 prompt caching이 자동 적용되어 지도 토큰은 0.1x로 캐싱됩니다
+
+MCP 도구 등록이 필요 없으므로 **도구 정의 오버헤드가 0**입니다.
+
+> **왜 MCP가 아니라 Hook인가요?**
+>
+> MCP로 만들면 두 가지 문제가 생깁니다:
+> 1. Claude가 도구를 호출할지 말지 스스로 판단합니다 — 안 쓸 수도 있습니다
+> 2. 도구 정의(description, parameters)가 매 요청마다 프롬프트에 포함되어 토큰을 먹습니다
+>
+> Hook은 이 두 문제를 원천 차단합니다.
+> 지도가 이미 컨텍스트에 있으므로 "호출 여부"를 고민할 필요가 없고,
+> MCP 도구 정의도 없으므로 추가 토큰이 0입니다.
+
+### (선택) MCP 서버 모드
+
+on-demand 검색이나 인덱스 리빌드가 필요하면 MCP로도 사용 가능합니다.
 
 `~/.mcp.json`에 추가:
 
@@ -156,15 +200,7 @@ uv venv && uv pip install -e .
 }
 ```
 
-`~/.claude/settings.json`에 활성화:
-
-```json
-{
-  "enabledMcpjsonServers": ["codebase-index"]
-}
-```
-
-Claude Code 재시작하면 바로 사용 가능합니다.
+Claude Code 재시작 후 사용 가능합니다.
 
 ## 테스트
 
