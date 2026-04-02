@@ -1,12 +1,11 @@
-"""BM25 + PageRank combined ranking — replaces keyword-only search."""
+"""Multi-signal ranking: BM25 for recall, custom scorer for precision."""
 
 import re
 import sqlite3
 from pathlib import Path
 
-from .storage import search_fts, get_file, get_project_stats, get_metadata
+from .storage import get_file_count, get_project_stats, get_metadata
 
-# Korean → English mappings for codebases with English file/symbol names
 _KO_EN_MAP: dict[str, list[str]] = {
   "네이버": ["naver"], "카탈로그": ["catalog", "catalogue"],
   "크롤링": ["crawl", "scraper"], "크롤러": ["crawler", "scraper"],
@@ -45,6 +44,8 @@ _STOP_WORDS = {
 
 def _tokenize(text: str) -> list[str]:
   """Extract keywords with Korean→English expansion. Unmapped Korean kept as-is."""
+  # Split camelCase BEFORE lowering
+  text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
   text = text.lower()
   tokens = re.findall(r"[a-z0-9\uac00-\ud7a3_]+", text)
   expanded = []
@@ -54,12 +55,143 @@ def _tokenize(text: str) -> list[str]:
       if mapped:
         expanded.extend(mapped)
       else:
-        expanded.append(t)  # Keep unmapped Korean tokens
+        expanded.append(t)
       continue
     parts = re.sub(r"([a-z])([A-Z])", r"\1 \2", t).lower().split()
     for p in parts:
       expanded.extend(p.split("_"))
   return [t for t in expanded if t and t not in _STOP_WORDS and len(t) > 1]
+
+
+def _retrieve_candidates(db: sqlite3.Connection, keywords: list[str], limit: int) -> list[dict]:
+  """
+  Stage 1: Candidate retrieval from two sources:
+  - FTS5 BM25 for symbol/import matching
+  - Direct SQL LIKE for path matching (FTS tokenizer may miss path components)
+  """
+  seen_ids: set[int] = set()
+  rows: list[tuple] = []
+
+  # Source A: FTS5 full-text search
+  fts_query = " OR ".join(f'"{t}"' for t in keywords)
+  if fts_query:
+    try:
+      fts_rows = db.execute(
+        """
+        SELECT f.id, f.path, f.language, f.lines, f.pagerank
+        FROM search_index
+        JOIN code_files f ON search_index.rowid = f.id
+        WHERE search_index MATCH ?
+        LIMIT ?
+        """,
+        (fts_query, limit * 5),
+      ).fetchall()
+      for r in fts_rows:
+        if r[0] not in seen_ids:
+          seen_ids.add(r[0])
+          rows.append(r)
+    except sqlite3.OperationalError:
+      pass
+
+  # Source B: Direct path LIKE search — catches files FTS misses
+  for kw in keywords:
+    if len(kw) < 3:
+      continue
+    like_rows = db.execute(
+      """
+      SELECT id, path, language, lines, pagerank
+      FROM code_files
+      WHERE path LIKE ?
+      LIMIT ?
+      """,
+      (f"%{kw}%", limit * 2),
+    ).fetchall()
+    for r in like_rows:
+      if r[0] not in seen_ids:
+        seen_ids.add(r[0])
+        rows.append(r)
+
+  candidates = []
+  for file_id, path, lang, lines, pagerank in rows:
+    symbols = db.execute(
+      "SELECT name, kind, line FROM code_symbols WHERE file_id=? ORDER BY line LIMIT 15",
+      (file_id,),
+    ).fetchall()
+    candidates.append({
+      "file_id": file_id,
+      "path": path,
+      "language": lang,
+      "lines": lines,
+      "pagerank": pagerank,
+      "symbols": [{"name": r[0], "kind": r[1], "line": r[2]} for r in symbols],
+    })
+  return candidates
+
+
+def _score_candidate(candidate: dict, keywords: list[str]) -> float:
+  """
+  Stage 2: Multi-signal scoring.
+
+  Signals (in order of importance):
+  1. Path coverage  — how many keywords appear in the file path (strongest)
+  2. Path stem hit  — keyword matches the filename stem (very strong)
+  3. Symbol match   — keyword matches a function/class name (strong)
+  4. PageRank       — file's importance in the import graph (moderate)
+  """
+  path = candidate["path"]
+  path_lower = path.lower()
+  path_parts = path_lower.replace("/", " ").replace("_", " ").replace(".", " ").split()
+  path_stem = Path(path).stem.lower()
+  stem_parts = set(re.split(r"[_\-.]", path_stem))
+  symbol_names = {s["name"].lower() for s in candidate["symbols"]}
+
+  score = 0.0
+  matched_keywords = set()
+
+  for kw in keywords:
+    kw_matched = False
+
+    # Signal 1: path stem exact word match (strongest)
+    if kw in stem_parts:
+      score += 15.0
+      kw_matched = True
+    # Signal 2: path directory match
+    elif kw in path_parts:
+      score += 8.0
+      kw_matched = True
+    # Signal 3: path substring (weaker, requires 3+ char to avoid noise)
+    elif len(kw) >= 3 and kw in path_lower:
+      score += 5.0
+      kw_matched = True
+
+    # Signal 4: symbol exact match
+    if kw in symbol_names:
+      score += 6.0
+      kw_matched = True
+    elif any(kw in sym for sym in symbol_names if len(kw) >= 3):
+      score += 3.0
+      kw_matched = True
+
+    if kw_matched:
+      matched_keywords.add(kw)
+
+  # Coverage bonus: reward files matching MORE distinct keywords
+  if keywords:
+    coverage = len(matched_keywords) / len(set(keywords))
+    score *= (0.5 + coverage * 0.5)  # 50% base + 50% from coverage
+
+  # PageRank bonus (capped to avoid domination by hub files)
+  score += min(candidate["pagerank"] * 200, 5.0)
+
+  # Penalties
+  if "test" in path_lower or "spec" in path_lower or "__test" in path_lower:
+    score *= 0.6
+  if "_legacy" in path_lower or "deprecated" in path_lower:
+    score *= 0.7
+  if candidate["lines"] > 800:
+    score *= 0.9
+
+  return score
 
 
 def find_relevant_files(
@@ -68,59 +200,42 @@ def find_relevant_files(
   limit: int = 15,
 ) -> list[dict]:
   """
-  Find relevant files using BM25 full-text search + PageRank.
-  Combined score = normalized_bm25 * 0.7 + normalized_pagerank * 0.3
+  Two-stage ranking:
+  1. BM25 retrieves broad candidates from FTS5
+  2. Multi-signal scorer re-ranks by path, symbols, and PageRank
   """
   keywords = _tokenize(query)
   if not keywords:
     return []
 
-  fts_query = " ".join(keywords)
-  candidates = search_fts(db, fts_query, limit)
-
+  candidates = _retrieve_candidates(db, keywords, limit)
   if not candidates:
     return []
 
-  # Normalize BM25 scores (they're negative, more negative = more relevant)
-  bm25_scores = [c["bm25_score"] for c in candidates]
-  bm25_min = min(bm25_scores) if bm25_scores else 0
-  bm25_max = max(bm25_scores) if bm25_scores else 0
-  bm25_range = bm25_max - bm25_min if bm25_max != bm25_min else 1.0
+  # Score and sort
+  scored = []
+  for c in candidates:
+    s = _score_candidate(c, keywords)
+    if s > 0:
+      scored.append((s, c))
 
-  # Normalize PageRank scores
-  pr_scores = [c["pagerank"] for c in candidates]
-  pr_max = max(pr_scores) if pr_scores else 0
-  pr_max = pr_max if pr_max > 0 else 1.0
+  scored.sort(key=lambda x: x[0], reverse=True)
 
   results = []
-  for c in candidates:
-    # BM25: more negative = better, so invert
-    norm_bm25 = (bm25_max - c["bm25_score"]) / bm25_range if bm25_range else 1.0
-    norm_pr = c["pagerank"] / pr_max
-
-    combined = norm_bm25 * 0.85 + norm_pr * 0.15
-
-    # Penalize test/spec files
-    path_lower = c["path"].lower()
-    if "test" in path_lower or "spec" in path_lower:
-      combined *= 0.7
-
+  for score, c in scored[:limit]:
     top_symbols = [
       f"{s['kind']} {s['name']} (L{s['line']})"
       for s in c["symbols"][:10]
     ]
-
     results.append({
       "path": c["path"],
-      "score": round(combined * 100, 1),
+      "score": round(score, 1),
       "language": c["language"],
       "lines": c["lines"],
       "symbols": top_symbols,
       "pagerank": round(c["pagerank"], 4),
     })
-
-  results.sort(key=lambda x: x["score"], reverse=True)
-  return results[:limit]
+  return results
 
 
 def get_project_summary(db: sqlite3.Connection) -> dict:

@@ -7,9 +7,6 @@ dependencies = [
     "mcp[cli]>=1.0.0",
     "tree-sitter>=0.24.0",
     "tree-sitter-language-pack>=0.6.0",
-    "networkx>=3.0",
-    "numpy>=2.0",
-    "scipy>=1.13",
 ]
 
 [project.scripts]

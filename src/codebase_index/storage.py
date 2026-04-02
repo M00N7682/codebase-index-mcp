@@ -116,7 +116,11 @@ def upsert_file(db: sqlite3.Connection, fi: FileInfo, indexed_at: str) -> int:
     db.execute("DELETE FROM code_symbols WHERE file_id=?", (file_id,))
     db.execute("DELETE FROM imports WHERE file_id=?", (file_id,))
     # Remove old FTS entry
-    db.execute("DELETE FROM search_index WHERE rowid=?", (file_id,))
+    db.execute(
+      "INSERT INTO search_index(search_index, rowid, path, symbol_names, import_names) "
+      "VALUES('delete', ?, ?, ?, ?)",
+      (file_id, "", "", ""),
+    )
   else:
     cur = db.execute(
       "INSERT INTO code_files(path, language, lines, indexed_at) VALUES(?, ?, ?, ?)",
@@ -155,7 +159,11 @@ def delete_file(db: sqlite3.Connection, path: str) -> None:
   row = db.execute("SELECT id FROM code_files WHERE path=?", (path,)).fetchone()
   if row:
     file_id = row[0]
-    db.execute("DELETE FROM search_index WHERE rowid=?", (file_id,))
+    db.execute(
+      "INSERT INTO search_index(search_index, rowid, path, symbol_names, import_names) "
+      "VALUES('delete', ?, ?, ?, ?)",
+      (file_id, "", "", ""),
+    )
     db.execute("DELETE FROM code_files WHERE id=?", (file_id,))
 
 

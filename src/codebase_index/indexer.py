@@ -60,6 +60,39 @@ def _resolve_imports(db) -> None:
     insert_import_edges(db, edges)
 
 
+def _pagerank_simple(
+  nodes: set[int],
+  edges: list[tuple[int, int]],
+  alpha: float = 0.85,
+  iterations: int = 40,
+) -> dict[int, float]:
+  """Pure Python PageRank — no numpy/scipy dependency."""
+  n = len(nodes)
+  if n == 0:
+    return {}
+
+  score = {nid: 1.0 / n for nid in nodes}
+  out_degree: dict[int, int] = {nid: 0 for nid in nodes}
+  in_edges: dict[int, list[int]] = {nid: [] for nid in nodes}
+
+  for src, tgt in edges:
+    out_degree[src] += 1
+    in_edges[tgt].append(src)
+
+  base = (1.0 - alpha) / n
+  for _ in range(iterations):
+    new_score = {}
+    for nid in nodes:
+      rank = base
+      for src in in_edges[nid]:
+        if out_degree[src] > 0:
+          rank += alpha * score[src] / out_degree[src]
+      new_score[nid] = rank
+    score = new_score
+
+  return score
+
+
 def _compute_pagerank(db) -> None:
   """Compute PageRank on import graph and store scores."""
   edges = get_import_edge_list(db)
@@ -69,20 +102,8 @@ def _compute_pagerank(db) -> None:
   file_ids = get_all_file_ids(db)
   all_ids = set(file_ids.values())
 
-  try:
-    import networkx as nx
-  except ImportError:
-    # networkx not installed — skip PageRank
-    return
-
-  G = nx.DiGraph()
-  G.add_nodes_from(all_ids)
-  G.add_edges_from(edges)
-
-  try:
-    scores = nx.pagerank(G, alpha=0.85, max_iter=100)
-  except nx.PowerIterationFailedConvergence:
-    scores = nx.pagerank(G, alpha=0.85, max_iter=50, tol=1e-3)
+  # Pure Python PageRank — no numpy/scipy needed
+  scores = _pagerank_simple(all_ids, edges, alpha=0.85, iterations=40)
 
   update_pagerank_scores(db, scores)
 
@@ -104,9 +125,14 @@ def build_index(root: str) -> int:
   now = _now_iso()
   count = 0
 
-  # Clear existing data
+  # Clear existing data — drop and recreate FTS table (contentless can't DELETE)
+  db.execute("DROP TABLE IF EXISTS search_index")
   db.execute("DELETE FROM code_files")
-  db.execute("DELETE FROM search_index")
+  db.executescript("""
+    CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
+      path, symbol_names, import_names, content='', tokenize='unicode61'
+    );
+  """)
   db.commit()
 
   for path in tracked:
